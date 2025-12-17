@@ -24,7 +24,6 @@ Our goal was to shift decision-making from *reactive* to *forward-looking* by id
 - Which features consistently emerge as the strongest predictors?
 - Do nonlinear models outperform traditional linear approaches in this context? 
 
-- 
 
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide2.PNG)
 

@@ -95,7 +95,6 @@ These patterns suggested that **tree-based ensemble models** would outperform li
 
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide10.PNG)
 
-![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide10.PNG)
 
 ---
 

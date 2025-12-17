@@ -1,0 +1,308 @@
+---
+title: "The Normalizers EDA"
+author: "Team Normalizers"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: cosmo
+    number-sections: true
+editor: visual
+---
+
+```{r}
+
+#Setup
+
+getwd()
+
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(skimr)
+library(GGally)
+
+suppressPackageStartupMessages(library(GGally))  # optional for ggpairs
+theme_set(theme_minimal())
+
+```
+
+```{r}
+
+# 1) Load Datasets
+
+sp_prod <- read_csv("sponsoredproducts_product_ads_daily.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(reportdate = ymd(reportdate))
+
+sp_camp <- read_csv("sponsoredproducts_campaigns_daily.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(reportdate = ymd(reportdate)) %>%
+  select(
+    campaignid, reportdate, campaignstatus, campaignbudget, campaignbudgettype, biddingstrategy,
+    impressions_camp = impressions, clicks_camp = clicks, cost_camp = cost,
+    convs_camp = attributedconversions14d, sales_camp = attributedsales14d
+  )
+```
+
+```{r}
+
+# 2) MERGE (left join) → ASIN × Day grain
+sp_joined <- sp_prod %>%
+  left_join(sp_camp, by = c("campaignid", "reportdate")) %>%
+  arrange(asin, reportdate)
+```
+
+```{r}
+
+# 3) KPIs + calendar features
+
+sp_joined <- sp_joined %>%
+  mutate(
+    ctr  = if_else(impressions > 0, clicks / impressions, 0),
+    cvr  = if_else(clicks > 0, attributedconversions14d / clicks, 0),
+    cpc  = if_else(clicks > 0, cost / clicks, 0),
+    roas = if_else(cost > 0, attributedsales14d / cost, NA_real_),
+    dow  = wday(reportdate, label = TRUE),
+    week = isoweek(reportdate),
+    month= floor_date(reportdate, "month")
+  ) %>%
+  mutate(across(c(ctr, cvr, cpc, roas), ~na_if(., Inf)))
+```
+
+```{r}
+
+# 4) Active subset 
+sp_active <- sp_joined %>%
+  filter(
+    impressions > 0 | clicks > 0 | cost > 0 |
+    attributedconversions14d > 0 | attributedsales14d > 0
+  )
+
+# Use sp_active for EDA going forward
+df <- sp_active
+```
+
+```{r}
+
+# Duplicate count at ASIN × Day
+dup_n <- df %>% count(asin, reportdate) %>% filter(n > 1) %>% nrow()
+message("Duplicate ASIN×Day rows: ", dup_n)
+
+# Missing values per column (table + quick bar plot)
+na_counts <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+
+print(na_counts %>% filter(n_missing > 0) %>% head(20))
+
+na_counts %>%
+  slice_max(n_missing, n = 25) %>%
+  ggplot(aes(reorder(column, n_missing), n_missing)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_gradient(low = "#AED6F1", high = "#1B4F72") + coord_flip() +
+  labs(title = "Missing values (top 25)", x = NULL, y = "Count")
+
+
+```
+
+```{r}
+# 6) Overview stats
+skim(df)  # types, missingness, basic stats
+
+# 7) Distributions of core metrics
+num_cols <- c("impressions","clicks","cost",
+              "attributedconversions14d","attributedsales14d",
+              "ctr","cvr","cpc","roas")
+
+df %>%
+  select(any_of(num_cols)) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(value, fill = metric)) +
+  geom_histogram(bins = 30, color = "white", alpha = 0.8) +
+  facet_wrap(~ metric, scales = "free") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Distributions of Core Metrics", x = "Value", y = "Count") +
+  theme_minimal()
+
+```
+
+```{r}
+# 8) KPI correlations
+df %>%
+  select(any_of(c("ctr","cvr","cpc","roas","cost","clicks","impressions"))) %>%
+  drop_na() %>%
+  ggpairs(progress = FALSE)
+
+# 9) Daily trends (aggregated)
+daily <- df %>%
+  group_by(reportdate) %>%
+  summarise(
+    impressions = sum(impressions, na.rm = TRUE),
+    clicks      = sum(clicks, na.rm = TRUE),
+    cost        = sum(cost, na.rm = TRUE),
+    sales       = sum(attributedsales14d, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-reportdate, names_to = "metric", values_to = "value")
+
+ggplot(daily, aes(reportdate, value, color = metric)) +
+  geom_line(size = 1.1) +
+  scale_color_brewer(palette = "Oranges") +
+  facet_wrap(~ metric, scales = "free_y") +
+  labs(title = "Daily Trends Over Time", x = "Date", y = "Value", color = "Metric") +
+  theme_minimal()
+```
+
+```{r}
+# 10) Weekday effects on KPIs
+df %>%
+  mutate(dow = wday(reportdate, label = TRUE)) %>%
+  summarise(
+    mean_ctr  = mean(ctr,  na.rm = TRUE),
+    mean_cvr  = mean(cvr,  na.rm = TRUE),
+    mean_cpc  = mean(cpc,  na.rm = TRUE),
+    mean_roas = mean(roas, na.rm = TRUE),
+    .by = dow
+  ) %>%
+  pivot_longer(-dow, names_to = "kpi", values_to = "value") %>%
+  ggplot(aes(dow, value, fill = dow)) +
+  geom_col(show.legend = FALSE, alpha = 0.9) +
+  scale_fill_brewer(palette = "Oranges") +
+  facet_wrap(~ kpi, scales = "free_y") +
+  labs(title = "Weekday Effects on KPIs", x = "Day of Week", y = "Mean Value") +
+  theme_minimal()
+
+```
+
+```{r}
+# 11) Top entities
+# Campaigns
+df %>%
+  summarise(spend = sum(cost, na.rm = TRUE), .by = campaignid) %>%
+  slice_max(spend, n = 10) %>%
+  ggplot(aes(reorder(campaignid, spend), spend, fill = spend)) +
+  geom_col() +
+  scale_fill_gradient(low = "#FAD7A0", high = "#CA6F1E") +
+  coord_flip() +
+  labs(title = "Top 10 Campaigns by Spend", x = "Campaign", y = "Total Spend") +
+  theme_minimal()
+
+# ASINs
+df %>%
+  summarise(sales = sum(attributedsales14d, na.rm = TRUE), .by = asin) %>%
+  slice_max(sales, n = 10) %>%
+  ggplot(aes(reorder(asin, sales), sales, fill = sales)) +
+  geom_col() +
+  scale_fill_gradient(low = "#A9DFBF", high = "#1E8449") +
+  coord_flip() +
+  labs(title = "Top 10 ASINs by Sales", x = "ASIN", y = "Total Sales") +
+  theme_minimal()
+
+
+```
+
+```{r}
+# 12) Outlier scan (boxplots)
+df %>%
+  select(any_of(c("impressions","clicks","cost","attributedsales14d","cpc","roas"))) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(metric, value, fill = metric)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  scale_fill_brewer(palette = "Paste7") +
+  coord_flip() +
+  labs(title = "Outlier Scan by Metric", x = NULL, y = NULL) +
+  theme_minimal()
+
+```
+
+Correlation Matrix
+
+```{r}
+
+library(tidyverse)
+library(reshape2)
+
+corr_vars <- sp_active %>%
+  select(
+    impressions,
+    clicks,
+    cost,
+    attributedconversions14d,
+    attributedsales14d,
+    ctr,
+    cvr,
+    cpc,
+    roas
+  )
+
+corr_matrix <- cor(corr_vars, use = "complete.obs", method = "pearson")
+
+corr_long <- melt(corr_matrix)
+
+
+ggplot(corr_long, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(value, 2)), 
+            color = "black", size = 4) +
+  scale_fill_gradientn(
+    colors = c("#FFF3B0", "#F4A261", "#E63946"),
+    limits = c(-1, 1),
+    name = "Correlation"
+  ) +
+  labs(
+    title = "Correlation Matrix of Key Amazon Ads Metrics",
+    subtitle = "ASIN × Day Level (Pearson Correlations)",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  coord_fixed()
+
+
+```
+
+Summary Stats Train vs Test
+
+```{r}
+library(tidyr)
+
+summary_by_split <- bind_rows(
+  train_df %>% mutate(split = "Train"),
+  test_df  %>% mutate(split = "Test")
+) %>%
+  select(
+    split,
+    impressions,
+    clicks,
+    cost,
+    ctr,
+    cvr,
+    cpc,
+    roas,
+    attributedsales14d,
+    attributedconversions14d
+  ) %>%
+  group_by(split) %>%
+  summarise(across(
+    everything(),
+    list(
+      mean = ~mean(.x, na.rm = TRUE),
+      sd   = ~sd(.x, na.rm = TRUE)
+    ),
+    .names = "{.col}_{.fn}"
+  ))
+
+print(summary_by_split)
+
+```

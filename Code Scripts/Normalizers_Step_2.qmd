@@ -1,0 +1,1573 @@
+---
+title: "CP7 – Data Partitioning: Sponsored Products + Campaigns"
+author: "Marco Capoccia"
+course: "Practicum 621 "
+format: html
+editor: visual
+---
+
+## Project Context
+
+This analysis extends the previous modeling plan by focusing on **data partitioning** for our future predictive model. Our goal is to integrate two of the internal Amazon Ads datasets — `sponsoredproducts_product_ads_daily` and `sponsoredproducts_campaigns_daily` — to prepare a unified modeling table at the **ASIN × Day** level. This step sets up a time-aware training and testing structure for future regression and forecasting analyses.
+
+The core business question driving this integration is: \> *How do campaign-level factors (budget, bidding strategy, and status) influence next-day conversions and ROAS for individual products?*
+
+By joining the product-level and campaign-level performance data, we can model the short-term responsiveness of Sponsored Product Ads to campaign budget and bidding signals.
+
+------------------------------------------------------------------------
+
+## Data Preparation Steps
+
+### 1. Import & Cleaning
+
+Both CSV files were imported using the `tidyverse` and `lubridate` packages. Columns were standardized to lowercase using `janitor::clean_names()`, and `reportdate` was parsed as a proper date variable.
+
+### 2. Dataset Overview
+
+-   **Product Ads Dataset** (`sponsoredproducts_product_ads_daily`): Contains ASIN-level performance metrics including impressions, clicks, conversions, cost, and attributed sales.
+-   **Campaign Dataset** (`sponsoredproducts_campaigns_daily`): Contains campaign-level controls such as budget, status, bidding strategy, and aggregated daily performance.
+
+### 3. Join Logic
+
+A **left join** was used on the keys `campaignid` and `reportdate`. This ensures each product-level observation inherits its parent campaign’s daily controls while retaining all product entries, even if the campaign data is missing for that date.
+
+------------------------------------------------------------------------
+
+## R Code
+
+1.  Load Packages, Data sets, and Clean them:
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(rsample)
+library(recipes)   
+library(skimr)     
+library(slider)    
+library(glue)
+
+```
+
+```{r}
+
+#Why these packages? 
+# tidyverse : readr for fast CSVs, dplyr for data wrangling, ggplot2 for plots
+# lubridate : safe date parsing and date math (ymd, floor_date, wday, isoweek)
+# janitor : clean_names() to normalize headers -> lower_snake_case
+# rsample : provides time-respecting resampling; here we implement a simple
+# blocked split manually, but rsample is kept for future rolling CV
+
+
+# read_csv(): fast, typed CSV reader. show_col_types=FALSE hides verbose type msg.
+# clean_names(): ensures consistent column names (no spaces or mixed case).
+# ymd(): parses ISO-like dates safely into Date class for math & comparisons.
+sp_prod <- read_csv("sponsoredproducts_product_ads_daily.csv", show_col_types = FALSE) %>%
+clean_names() %>%
+mutate(reportdate = ymd(reportdate))
+
+# select(): keep only fields that are useful as campaign-side controls and perf
+sp_camp <- read_csv("sponsoredproducts_campaigns_daily.csv", show_col_types = FALSE) %>%
+clean_names() %>%
+mutate(reportdate = ymd(reportdate)) %>%
+select(campaignid, reportdate, campaignstatus, campaignbudget, campaignbudgettype,
+biddingstrategy, impressions_camp = impressions, clicks_camp = clicks,
+cost_camp = cost, convs_camp = attributedconversions14d, sales_camp = attributedsales14d)
+
+```
+
+2.  Join
+
+```{r}
+
+#A **left join** was used on the keys `campaignid` and `reportdate`. This ensures each product-level observation inherits its parent campaign’s daily controls while retaining all product entries, even if the campaign data is missing for that date.
+
+sp_joined <- sp_prod %>%
+left_join(sp_camp, by = c("campaignid", "reportdate")) %>%
+arrange(asin, reportdate)
+```
+
+3.  KPI's
+
+```{r}
+# Why: models benefit from rate metrics; also required for business reporting... (per clients asking)
+
+eps <- 1e-6
+sp_joined <- sp_joined %>%
+mutate(
+ctr = if_else(impressions > 0, clicks / impressions, 0),
+cvr = if_else(clicks > 0, attributedconversions14d / clicks, 0),
+cpc = if_else(clicks > 0, cost / clicks, 0),
+roas = if_else(cost > 0, attributedsales14d / cost, NA_real_),
+dow = wday(reportdate, label = TRUE),
+week = isoweek(reportdate),
+month = floor_date(reportdate, "month")
+) %>%
+mutate(across(c(ctr, cvr, cpc, roas), ~na_if(., Inf)))
+```
+
+4.  Integrity Check
+
+```{r}
+#Find the duplicates
+duplicates <- sp_joined %>%
+  group_by(asin, reportdate) %>%
+  filter(n() > 1) %>%
+  arrange(asin, reportdate)
+
+print(duplicates)
+
+# 4. Integrity checks ----------------------------------------------------------
+stopifnot(!any(is.na(sp_joined$reportdate)))
+```
+
+5.  Active Subset...
+
+```{r}
+# Motivation: long stretches of full zeros can dominate metrics and plots. We keep rows with any activity; we can relax/tighten this filter as needed.
+sp_active <- sp_joined %>%
+filter(impressions > 0 | clicks > 0 | cost > 0 | attributedconversions14d > 0 | attributedsales14d > 0)
+
+```
+
+6.  Time Partitioning
+
+```{r}
+# Time-based partitioning (blocked split) Why blocked? To emulate real deployment and avoid look-ahead leakage.
+# Strategy: 70% of the time range -> train; remaining 30% -> test.
+
+date_range <- range(sp_active$reportdate, na.rm = TRUE)
+message(sprintf("Data span: %s to %s", date_range[1], date_range[2]))
+
+train_start <- min(sp_active$reportdate)
+train_end <- train_start + days(floor(0.7 * as.numeric(diff(date_range))))
+test_start <- train_end + days(1)
+test_end <- max(sp_active$reportdate)
+
+train_df <- sp_active %>% filter(reportdate >= train_start & reportdate <= train_end)
+test_df <- sp_active %>% filter(reportdate >= test_start & reportdate <= test_end)
+
+split_summary <- tibble(
+set = c("train", "test"),
+from = c(min(train_df$reportdate), min(test_df$reportdate)),
+to = c(max(train_df$reportdate), max(test_df$reportdate)),
+n_rows= c(nrow(train_df), nrow(test_df)),
+n_asin= c(n_distinct(train_df$asin), n_distinct(test_df$asin))
+)
+print(split_summary)
+
+```
+
+7.  Stratified random split
+
+```{r eval=FALSE}
+# Stratified random split (i.i.d.)
+# Assumes: model_df exists; revenue is the continuous target.
+set.seed(621)
+
+# Create stratification bins from continuous revenue (handles NAs safely)
+model_df <- model_df %>%
+  mutate(
+    revenue = as.numeric(revenue),
+    revenue_q = ntile(replace_na(revenue, median(revenue, na.rm = TRUE)), 4) %>% factor()
+  )
+
+# 80/20 split, stratified by revenue quartile
+rand_split <- initial_split(model_df, prop = 0.8, strata = revenue_q)
+train_rand <- training(rand_split)
+test_rand  <- testing(rand_split)
+
+# 5-fold CV on the training set, stratified the same way
+cv_rand <- vfold_cv(train_rand, v = 5, strata = revenue_q)
+
+# Diagnostics: row counts + quartile balance check (proportions per set)
+diag_counts <- list(
+  train_rows = nrow(train_rand),
+  test_rows  = nrow(test_rand),
+  folds      = length(cv_rand$splits)
+)
+
+strat_check <- bind_rows(
+  train_rand %>% mutate(set = "train"),
+  test_rand  %>% mutate(set = "test")
+) %>%
+  count(set, revenue_q) %>%
+  group_by(set) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+print(diag_counts)
+strat_check
+
+
+```
+
+```{r}
+# 7. Save partitioned data -----------------------------------------------------
+dir.create("artifacts", showWarnings = FALSE)
+write_csv(train_df, "artifacts/train_sp_joined.csv")
+write_csv(test_df, "artifacts/test_sp_joined.csv")
+
+```
+
+```{r}
+# 8. Visualization -------------------------------------------------------------
+counts_by_day <- sp_active %>%
+count(reportdate, name = "n_rows") %>%
+mutate(set = case_when(
+reportdate >= train_start & reportdate <= train_end ~ "train",
+reportdate >= test_start & reportdate <= test_end ~ "test",
+TRUE ~ "other"
+))
+
+ggplot(counts_by_day, aes(reportdate, n_rows, fill=set)) +
+geom_col(show.legend = FALSE) +
+geom_vline(xintercept = c(train_end, test_start), linetype = "dashed") +
+labs(title = "CP7 Time-Based Partition (ASIN × Day)", x = "Date", y = "Row Count") +
+theme_minimal()
+
+```
+
+Set Up: for Ridge and Lasso Regression Models
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(glmnet)   # for Ridge & LASSO
+
+options(scipen = 4)
+
+```
+
+Load Train/Test + Build Out "Next-Day ROAS"
+
+```{r}
+#Load partitions 
+train_raw <- read_csv("artifacts/train_sp_joined.csv", show_col_types = FALSE)
+test_raw  <- read_csv("artifacts/test_sp_joined.csv",  show_col_types = FALSE)
+
+#Create next-day ROAS grouped by ASIN 
+make_next_day <- function(df) {
+  df %>%
+    arrange(asin, reportdate) %>%
+    group_by(asin) %>%
+    mutate(next_day_roas = lead(roas)) %>%  # roas is already in CP7 KPIs
+    ungroup() %>%
+    filter(!is.na(next_day_roas))
+}
+
+train_nd <- make_next_day(train_raw)
+test_nd  <- make_next_day(test_raw)
+
+```
+
+Variable Selection
+
+```{r}
+#Variables for models
+
+num_vars <- c(
+  "impressions_camp",
+  "clicks_camp",
+  "cost_camp",
+  "convs_camp",
+  "sales_camp",
+  "ctr",
+  "cvr",
+  "cpc",
+  "roas",
+  "campaignbudget",
+  "week"
+)
+
+factor_vars <- c(
+  "biddingstrategy",
+  "dow",
+  "month"
+)
+
+y_var <- "next_day_roas"
+
+#Prep modeling data: keeping only needed cols &factors
+
+prep_mod_df <- function(df) {
+  df %>%
+    select(all_of(c(y_var, num_vars, factor_vars))) %>%
+    mutate(across(all_of(factor_vars), as.factor)) %>%
+    drop_na()
+}
+
+train_mod <- prep_mod_df(train_nd)
+test_mod  <- prep_mod_df(test_nd)
+
+```
+
+Make Model Matrix X and Outcome Y
+
+```{r}
+# All possible factors based on the dataset
+factor_vars_all <- c("biddingstrategy", "campaignbudgettype", "dow", "month")
+
+# Keep only factors with >= 2 levels in TRAINING data
+factor_vars <- factor_vars_all[sapply(train_mod[factor_vars_all],
+                                      function(x) nlevels(x) > 1)]
+
+factor_vars
+
+```
+
+```{r}
+
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(yardstick)
+
+# 1) Target variable
+target <- "roas"
+
+# 2) Base predictor list
+base_predictors <- c(
+  "impressions", "clicks", "cost",
+  "attributedconversions14d", "attributedsales14d",
+  "ctr", "cvr", "cpc",
+  "campaignbudget", "campaignstatus", "campaignbudgettype",
+  "biddingstrategy", "dow", "week", "month"
+)
+
+# 3) Predictors that exist in BOTH train & test
+common_cols <- intersect(names(train_df), names(test_df))
+predictors  <- intersect(base_predictors, common_cols)
+
+# ROAS is the target → remove from predictors
+predictors <- setdiff(predictors, "roas")
+
+# 4) Identify categorical vars that actually exist
+cat_vars <- intersect(
+  c("campaignstatus", "campaignbudgettype", "biddingstrategy", "dow"),
+  predictors
+)
+
+# 5) Build *clean* train dataset
+train_clean <- train_df %>%
+  filter(!is.na(roas)) %>%                # ROAS cannot be NA
+  mutate(across(all_of(cat_vars), as.factor)) %>%
+  select(all_of(c(target, predictors)))
+
+# 6) Build *clean* test dataset
+test_clean <- test_df %>%
+  filter(!is.na(roas)) %>%
+  mutate(across(all_of(cat_vars), as.factor)) %>%
+  select(all_of(c(target, predictors)))
+
+# 7) Match factor levels in test to match train
+for (v in cat_vars) {
+  test_clean[[v]] <- factor(test_clean[[v]], levels = levels(train_clean[[v]]))
+}
+
+# 8) Final formula
+model_formula <- as.formula(
+  paste(target, "~", paste(predictors, collapse = " + "))
+)
+
+# Check structures
+str(train_clean)
+str(test_clean)
+
+```
+
+Decision Tree (ROAS)
+
+```{r}
+
+# -------------------------------
+# CP8 Model: Decision Tree (ROAS)
+# -------------------------------
+library(rpart)
+library(rpart.plot)
+library(yardstick)
+
+set.seed(621)
+
+tree_fit <- rpart(
+  formula = model_formula,
+  data    = train_model,
+  method  = "anova",
+  control = rpart.control(
+    minsplit = 20,
+    cp       = 0.01
+  )
+)
+
+# Visualize tree (optional)
+rpart.plot(tree_fit, main = "Decision Tree for ROAS")
+
+# Predict on test set
+test_model$tree_pred <- predict(tree_fit, newdata = test_model)
+
+# Evaluate on test set
+tree_metrics <- metric_set(rmse, mae, rsq)(
+  data    = test_model,
+  truth   = roas,
+  estimate = tree_pred
+)
+
+tree_metrics
+
+```
+
+Random Forest (ROAS)
+
+```{r}
+
+# -----------------------------------
+# CP8 Model: Random Forest (ROAS)
+# -----------------------------------
+library(randomForest)
+library(yardstick)
+
+set.seed(621)
+
+rf_fit <- randomForest(
+  formula    = model_formula,
+  data       = train_clean,
+  ntree      = 300,
+  mtry       = floor(sqrt(length(predictors))),
+  importance = TRUE,
+  na.action  = na.omit
+)
+
+# Predict on *test_clean*
+test_clean$rf_pred <- predict(rf_fit, newdata = test_clean)
+
+# Evaluate
+rf_metrics <- metric_set(rmse, mae, rsq)(
+  data    = test_clean,
+  truth   = roas,
+  estimate = rf_pred
+)
+
+rf_metrics
+
+```
+
+Random Forest with Different Tuning Parameters
+
+```{r}
+
+
+set.seed(621)
+
+rf_grid <- expand.grid(
+  mtry = c(
+    floor(sqrt(length(predictors)) / 2),
+    floor(sqrt(length(predictors))),
+    floor(sqrt(length(predictors)) * 2)
+  ),
+  nodesize = c(5, 10)
+)
+
+rf_results <- purrr::pmap_dfr(rf_grid, function(mtry, nodesize) {
+  
+  fit <- randomForest(
+    formula    = model_formula,
+    data       = train_clean,
+    ntree      = 300,
+    mtry       = mtry,
+    nodesize   = nodesize,
+    importance = FALSE
+  )
+  
+  preds <- predict(fit, newdata = test_clean)
+  
+  tibble(
+    mtry = mtry,
+    nodesize = nodesize,
+    rmse = rmse_vec(test_clean$roas, preds),
+    rsq  = rsq_vec(test_clean$roas, preds)
+  )
+})
+
+rf_results
+
+```
+
+```{r}
+test_clean$residuals <- test_clean$roas - test_clean$rf_pred
+
+ggplot(test_clean, aes(rf_pred, residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed")
+
+```
+
+## Predictive Modelling: Gradient Boosting, kNN regression, PLS
+
+Data Prep: Identifying predictors & target variables
+
+------------------------------------------------------------------------
+
+```{r}
+target <- "roas"
+
+drop_cols <- c(
+  target,
+  "asin", "sku", "adid", "adgroupid", "campaignid",
+  "reportdate", "campaignname", "adgroupname",
+  "week_start", "year_month"
+)
+
+predictors <- setdiff(names(train_df), drop_cols)
+```
+
+Data Prep: Convert categorical variables to factors
+
+```{r}
+categorical_vars <- c(
+  "campaignstatus.x", "campaignstatus.y",
+  "campaignbudgettype", "biddingstrategy",
+  "dow", "month"
+)
+
+train_df <- train_df %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+test_df <- test_df %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+```
+
+Data Prep: Remove missing values
+
+```{r}
+train_df <- train_df %>% filter(!is.na(roas))
+test_df  <- test_df  %>% filter(!is.na(roas))
+```
+
+XG Boost Setup
+
+```{r}
+x_train_df <- train_df[, predictors, drop = FALSE]
+x_test_df  <- test_df[,  predictors, drop = FALSE]
+
+# Convert factors to dummy variables automatically
+X_train <- model.matrix(~ . - 1, data = x_train_df)
+X_test  <- model.matrix(~ . - 1, data = x_test_df)
+
+y_train <- train_df[[target]]
+y_test  <- test_df[[target]]
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+```
+
+```{r}
+library(dplyr)
+
+# ---- 0) Define target & columns to drop ----
+target <- "roas"
+drop_cols <- c(target, "asin","sku","adid","adgroupid","campaignid",
+               "reportdate","campaignname","adgroupname","week_start","year_month")
+
+# all predictors except the drops
+predictors <- setdiff(names(train_df), drop_cols)
+
+# Which columns should be treated as categorical?
+categorical_vars <- intersect(
+  c("campaignstatus.x","campaignstatus.y","campaignbudgettype","biddingstrategy","dow","month"),
+  predictors
+)
+
+# ---- 1) Bind train/test to align factor levels, mark rows ----
+train_df$.set <- "train"
+test_df$.set  <- "test"
+all_df <- bind_rows(train_df, test_df)
+
+# Ensure chars -> factors for the categorical set
+all_df <- all_df %>%
+  mutate(across(all_of(categorical_vars), ~as.factor(.)))
+
+# ---- 2) Drop bad predictors:
+# (a) Single-level factors
+is_single_level_factor <- function(v) is.factor(v) && nlevels(v) < 2
+bad_fct <- names(Filter(is_single_level_factor, all_df[, predictors, drop = FALSE]))
+
+# (b) Zero-variance numeric columns
+is_zero_var_num <- function(v) is.numeric(v) && (sd(v, na.rm = TRUE) == 0 || all(is.na(v)))
+bad_num <- names(Filter(is_zero_var_num, all_df[, predictors, drop = FALSE]))
+
+bad_cols <- union(bad_fct, bad_num)
+if (length(bad_cols)) {
+  message("Dropping zero-variance/single-level predictors: ", paste(bad_cols, collapse = ", "))
+}
+predictors_safe <- setdiff(predictors, bad_cols)
+
+# ---- 3) Model matrix on the combined data (keeps columns consistent)
+x_all_df <- all_df[, predictors_safe, drop = FALSE]
+
+# Make sure any remaining characters are factors so model.matrix can one-hot them
+x_all_df <- x_all_df %>% mutate(across(where(is.character), as.factor))
+
+X_all <- model.matrix(~ . - 1, data = x_all_df)
+
+# Targets
+y_all <- all_df[[target]]
+
+# ---- 4) Split matrices back into train/test
+train_idx <- which(all_df$.set == "train")
+test_idx  <- which(all_df$.set == "test")
+
+X_train <- X_all[train_idx, , drop = FALSE]
+X_test  <- X_all[test_idx,  , drop = FALSE]
+
+y_train <- y_all[train_idx]
+y_test  <- y_all[test_idx]
+
+# (Optional) sanity check
+stopifnot(nrow(X_train) == length(y_train), nrow(X_test) == length(y_test))
+
+# ---- 5) Fit XGBoost as before ----
+library(xgboost)
+dtrain <- xgb.DMatrix(X_train, label = y_train)
+dtest  <- xgb.DMatrix(X_test,  label = y_test)
+
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.08,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 1000,
+  early_stopping_rounds = 50,
+  watchlist = list(train = dtrain),
+  verbose = 0
+)
+
+pred_test <- predict(xgb_fit, dtest)
+rmse <- sqrt(mean((pred_test - y_test)^2))
+r2   <- cor(pred_test, y_test, use = "complete.obs")^2
+cat("Test RMSE:", round(rmse, 3), " | R²:", round(r2, 3), "\n")
+
+
+# ==== Updated XGBoost for ROAS with leakage-guard + regularization ====
+# Assumes: train_df, test_df already exist from your time-based split
+
+library(dplyr)
+library(xgboost)
+
+# --- 0) Target & columns to drop ---
+target <- "roas"
+
+drop_cols <- c(
+  target,
+  "asin","sku","adid","adgroupid","campaignid",
+  "reportdate","campaignname","adgroupname","week_start","year_month"
+)
+
+# Start from all columns except the drops
+predictors <- setdiff(names(train_df), drop_cols)
+
+# --- 1) Remove obvious target proxies (leakage) ---
+# These directly encode sales/ROAS and will inflate scores for same-day ROAS
+leakage_cols <- c("attributedsales14d", "sales_camp", "roasclicks14d")
+predictors <- setdiff(predictors, leakage_cols)
+
+# If you also want to be stricter for same-day deployment, uncomment:
+# predictors <- setdiff(predictors, c("attributedconversions14d","convs_camp"))
+
+# Categorical columns (use only those that are actually in predictors)
+categorical_vars <- intersect(
+  c("campaignstatus.x","campaignstatus.y","campaignbudgettype","biddingstrategy","dow","month"),
+  predictors
+)
+
+# --- 2) Bind train/test to align factor levels; drop single-level/zero-var predictors ---
+train_df$.set <- "train"
+test_df$.set  <- "test"
+all_df <- bind_rows(train_df, test_df)
+
+# Ensure categoricals are factors
+all_df <- all_df %>% mutate(across(all_of(categorical_vars), ~as.factor(.)))
+
+# Drop single-level factors
+is_single_level_factor <- function(v) is.factor(v) && nlevels(v) < 2
+bad_fct <- names(Filter(is_single_level_factor, all_df[, predictors, drop = FALSE]))
+
+# Drop zero-variance numerics
+is_zero_var_num <- function(v) is.numeric(v) && (sd(v, na.rm = TRUE) == 0 || all(is.na(v)))
+bad_num <- names(Filter(is_zero_var_num, all_df[, predictors, drop = FALSE]))
+
+bad_cols <- union(bad_fct, bad_num)
+if (length(bad_cols)) message("Dropping zero-variance/single-level predictors: ", paste(bad_cols, collapse = ", "))
+predictors_safe <- setdiff(predictors, bad_cols)
+
+# --- 3) Build model matrices consistently (one-hot factors) ---
+x_all_df <- all_df[, predictors_safe, drop = FALSE]
+# Any remaining characters -> factors for one-hot encoding
+x_all_df <- x_all_df %>% mutate(across(where(is.character), as.factor))
+
+X_all <- model.matrix(~ . - 1, data = x_all_df)
+
+y_all <- all_df[[target]]
+
+# Split back
+train_idx <- which(all_df$.set == "train")
+test_idx  <- which(all_df$.set == "test")
+
+X_train <- X_all[train_idx, , drop = FALSE]
+X_test  <- X_all[test_idx,  , drop = FALSE]
+y_train <- y_all[train_idx]
+y_test  <- y_all[test_idx]
+
+# (Optional) Remove rows with missing target (shouldn’t exist for same-day, but safe)
+keep_tr <- !is.na(y_train); keep_te <- !is.na(y_test)
+X_train <- X_train[keep_tr, , drop = FALSE]; y_train <- y_train[keep_tr]
+X_test  <- X_test[keep_te,  , drop = FALSE]; y_test  <- y_test[keep_te]
+
+# --- 4) Train with light regularization to reduce overfitting ---
+dtrain <- xgb.DMatrix(X_train, label = y_train)
+dtest  <- xgb.DMatrix(X_test,  label = y_test)
+
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.05,              # lower LR
+  max_depth = 4,           # shallower trees
+  subsample = 0.7,         # row subsampling
+  colsample_bytree = 0.7,  # feature subsampling
+  min_child_weight = 5,    # discourage tiny leaves
+  reg_lambda = 1.0,        # L2
+  reg_alpha  = 0.1         # L1
+)
+
+xgb_fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 3000,
+  watchlist = list(train = dtrain),
+  early_stopping_rounds = 75,
+  verbose = 0
+)
+
+# --- 5) Evaluate on TEST (RMSE, MAE, R^2) ---
+pred_test <- predict(xgb_fit, dtest)
+rmse <- sqrt(mean((pred_test - y_test)^2))
+mae  <- mean(abs(pred_test - y_test))
+r2   <- cor(pred_test, y_test, use = "complete.obs")^2
+
+cat("Test RMSE:", round(rmse, 3), " | MAE:", round(mae, 3), " | R²:", round(r2, 3), "\n")
+
+# --- 6) Top features (gain) ---
+imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X_train))
+print(head(imp, 15))
+
+# (Optional) Quick residuals sanity check:
+# hist(pred_test - y_test, main="Residuals", xlab="Prediction Error")
+
+```
+
+```{r}
+# Baseline: predict train mean
+base_pred <- rep(mean(train_df$roas, na.rm = TRUE), nrow(test_df))
+base_rmse <- sqrt(mean((base_pred - test_df$roas)^2))
+base_mae  <- mean(abs(base_pred - test_df$roas))
+base_r2   <- cor(base_pred, test_df$roas, use = "complete.obs")^2
+cat("Baseline — RMSE:", round(base_rmse,3), " MAE:", round(base_mae,3), " R²:", round(base_r2,3), "\n")
+```
+
+```{r}
+#XGBOOST Grid Search: Manual Loop
+
+library(xgboost)
+library(data.table)
+
+# Define parameter grid
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(3, 4, 6),
+  min_child_weight = c(1, 5)
+)
+
+# Containers
+results <- list()
+
+# Prepare DMatrix
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+# Loop through grid
+for (i in seq_len(nrow(param_grid))) {
+  p <- param_grid[i, ]
+  
+  params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = p$eta,
+    max_depth = p$max_depth,
+    min_child_weight = p$min_child_weight,
+    subsample = 0.7,
+    colsample_bytree = 0.7,
+    reg_alpha = 0.1,
+    reg_lambda = 1.0
+  )
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 3000,
+    early_stopping_rounds = 75,
+    watchlist = list(train = dtrain),
+    verbose = 0
+  )
+  
+  # Predict and evaluate
+  pred <- predict(model, dtest)
+  rmse <- sqrt(mean((pred - y_test)^2))
+  mae <- mean(abs(pred - y_test))
+  r2 <- cor(pred, y_test)^2
+  
+  results[[i]] <- data.frame(
+    eta = p$eta,
+    max_depth = p$max_depth,
+    min_child_weight = p$min_child_weight,
+    best_iteration = model$best_iteration,
+    RMSE = round(rmse, 4),
+    MAE = round(mae, 4),
+    R2 = round(r2, 4)
+  )
+  
+  cat(sprintf("Run %d: eta=%.2f, depth=%d, child_weight=%d → RMSE=%.4f, R²=%.4f\n",
+              i, p$eta, p$max_depth, p$min_child_weight, rmse, r2))
+}
+
+# Combine results
+results_df <- rbindlist(results)
+print(results_df)
+
+
+##Feature importance across runs 
+
+# Extract full importance table (includes Gain, Cover, Frequency)
+imp <- xgb.importance(model = model, feature_names = colnames(X_train))
+imp$Run <- i  # track which run this came from
+
+# Store results
+if (!exists("importance_log")) {
+  importance_log <- imp
+} else {
+  importance_log <- rbind(importance_log, imp)
+}
+
+
+#Visualization for Feature Importance
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Average scores per feature across runs
+imp_summary <- importance_log %>%
+  group_by(Feature) %>%
+  summarise(
+    Mean_Gain = mean(Gain),
+    Mean_Cover = mean(Cover),
+    Mean_Freq = mean(Frequency),
+    .groups = 'drop'
+  )
+
+# Long format for plotting
+imp_long <- imp_summary %>%
+  pivot_longer(cols = starts_with("Mean_"), names_to = "Metric", values_to = "Score")
+
+# Plot top 15 features by each metric
+top_feats <- imp_long %>%
+  group_by(Metric) %>%
+  slice_max(Score, n = 15)
+
+ggplot(top_feats, aes(x = reorder(Feature, Score), y = Score, fill = Metric)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(title = "Top Feature Importances Across XGBoost Runs",
+       x = "Feature", y = "Average Importance Score") +
+  theme_minimal()
+```
+
+```{r}
+#Modifications for better visuals
+
+# Rename feature names for readability
+pretty_names <- c(
+  cost = "Total Cost",
+  cpc = "Cost per Click",
+  cvr = "Conversion Rate",
+  cost_camp = "Campaign Cost",
+  spend = "Spend",
+  impressions = "Impressions",
+  ctr = "Click-Through Rate",
+  impressions_camp = "Campaign Impressions",
+  campaignbudget = "Campaign Budget",
+  clicks_camp = "Campaign Clicks",
+  convs_camp = "Campaign Conversions",
+  week = "Week Index",
+  attributedconversions14d = "14d Attributed Conversions",
+  clicks = "Clicks",
+  `dow^5` = "Day of Week (Spline)"
+)
+
+imp_long$Feature <- recode(imp_long$Feature, !!!pretty_names)
+```
+
+```{r}
+#Updated visualization 
+library(ggplot2)
+
+p_all <- ggplot(top_feats, aes(x = reorder(Feature, Score), y = Score, fill = Metric)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  coord_flip() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Top Feature Importances Across XGBoost Runs",
+    subtitle = "Compared by Gain, Cover, and Frequency",
+    x = NULL, y = "Average Importance Score"
+  ) +
+  scale_fill_manual(values = c("Mean_Gain" = "#4F81BD", "Mean_Cover" = "#C0504D", "Mean_Freq" = "#9BBB59")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12, margin = margin(b = 10)),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+#Create plot with top features
+library(ggplot2)
+
+p_shared <- ggplot(highlight_feats, aes(x = reorder(Feature, Score), y = Score, fill = Metric)) +
+  geom_col(position = "dodge", width = 0.7) +
+  coord_flip() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  labs(
+    title = "Consistently Top Features Across XGBoost Runs",
+    subtitle = "Appeared in Top 5 for Gain, Cover, and Frequency",
+    x = NULL, y = "Importance Score"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.text.y = element_text(size = 11),
+    panel.grid.major.y = element_blank()
+  )
+
+ggsave("feature_importance_full.png", plot = p_all, width = 10, height = 6, dpi = 300)
+ggsave("feature_importance_top5_shared.png", plot = p_shared, width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+##Assumptions Check 
+# Residuals
+resid <- pred_test - y_test
+fitted <- pred_test
+
+# === 1. Distribution of residuals ===
+hist(resid, main = "Residuals Histogram", xlab = "Prediction Error", col = "lightgray", breaks = 30)
+
+# === 2. Predicted vs Actual ===
+plot(y_test, fitted, pch=16, cex=.6,
+     main = "Predicted vs Actual ROAS", xlab = "Actual ROAS", ylab = "Predicted ROAS")
+abline(0,1,col="red", lty=2)
+
+# === 3. Residuals over time ===
+plot(test_df$reportdate, resid, pch=16, cex=.6,
+     main = "Residuals Over Time", xlab = "Date", ylab = "Residual")
+abline(h = 0, lty=2)
+
+# === 4. Residuals vs Predictions ===
+plot(fitted, resid, pch=16, cex=.6,
+     main = "Residuals vs Predicted ROAS", xlab = "Predicted ROAS", ylab = "Residuals")
+abline(h = 0, lty=2)
+
+# === 5. Residuals by Day of Week (DOW) ===
+boxplot(resid ~ test_df$dow, main = "Residuals by Day of Week", xlab = "DOW", ylab = "Residuals")
+
+# === 6. Residuals by Campaign (if available) ===
+boxplot(resid ~ test_df$campaignname, las = 2, cex.axis = 0.7,
+        main = "Residuals by Campaign",
+        xlab = "Campaign", ylab = "Residuals",
+        col = "lightgray", outline = TRUE)
+abline(h = 0, lty = 2, col = "darkred")
+
+# === 7. Check for outliers ===
+plot(resid, pch=16, main = "Residual Index Plot", ylab = "Residuals")
+abline(h = c(-1.5, 1.5) * sd(resid), col = "red", lty = 2)
+
+# === 8. Compare baseline model error ===
+baseline <- mean(train_df$roas, na.rm = TRUE)
+baseline_resid <- test_df$roas - baseline
+lines(rep(baseline, length(y_test)), col="darkgray")
+
+```
+
+```{r}
+# First half of diagnostics
+png("diagnostics_part1.png", width = 1200, height = 800, res = 150)
+
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+
+# 1. Residuals Histogram
+hist(resid, main = "Residuals Histogram", xlab = "Prediction Error", col = "lightgray", breaks = 30)
+
+# 2. Predicted vs Actual
+plot(y_test, pred_test, pch = 16, cex = 0.6, main = "Predicted vs Actual", xlab = "Actual ROAS", ylab = "Predicted")
+abline(0, 1, col = "red", lty = 2)
+
+# 3. Residuals over Time
+plot(test_df$reportdate, resid, pch = 16, cex = 0.6, main = "Residuals Over Time", xlab = "Date", ylab = "Residual")
+abline(h = 0, lty = 2)
+
+# 4. Residuals vs Predicted
+plot(pred_test, resid, pch = 16, cex = 0.6, main = "Residuals vs Predicted", xlab = "Predicted ROAS", ylab = "Residual")
+abline(h = 0, lty = 2)
+
+# 5. Residuals by Day of Week
+boxplot(resid ~ test_df$dow, main = "Residuals by Day of Week", xlab = "DOW", ylab = "Residuals", col = "lightblue")
+
+# 6. Residual Index Plot
+plot(resid, pch = 16, main = "Residual Index Plot", ylab = "Residuals")
+abline(h = c(-1.5, 1.5) * sd(resid), col = "red", lty = 2)
+
+dev.off()
+```
+
+```{r}
+# ==== Robust KNN Regression (caret) ====
+
+library(dplyr)
+library(caret)
+
+target <- "roas"
+
+drop_cols <- c(
+  target,
+  "asin","sku","adid","adgroupid","campaignid",
+  "reportdate","campaignname","adgroupname","week_start","year_month"
+)
+predictors <- setdiff(names(train_df), drop_cols)
+leakage_cols <- c("attributedsales14d","sales_camp","roasclicks14d")
+predictors <- setdiff(predictors, leakage_cols)
+
+train_df <- train_df %>% filter(!is.na(.data[[target]]))
+test_df  <- test_df  %>% filter(!is.na(.data[[target]]))
+
+# --- Combine train/test so factor levels align ---
+train_df$.set <- "train"; test_df$.set <- "test"
+all_df <- bind_rows(train_df, test_df)
+
+# --- Drop single-level factors and zero-variance numeric predictors ---
+is_single_factor <- function(v) is.factor(v) && nlevels(v) < 2
+is_zero_num <- function(v) is.numeric(v) && (sd(v,na.rm=TRUE)==0 || all(is.na(v)))
+bad_cols <- names(Filter(is_single_factor, all_df[,predictors,drop=FALSE]))
+bad_cols <- union(bad_cols, names(Filter(is_zero_num, all_df[,predictors,drop=FALSE])))
+
+if(length(bad_cols)) message("Dropping low-variance predictors: ", paste(bad_cols, collapse=", "))
+predictors_safe <- setdiff(predictors, bad_cols)
+
+# --- One-hot encode with dummyVars (keeps factors consistent) ---
+allX <- all_df[, predictors_safe, drop = FALSE]
+allX <- allX %>% mutate(across(where(is.character), as.factor))
+dmy <- dummyVars(~ ., data = allX, fullRank = TRUE)
+X_all <- as.data.frame(predict(dmy, newdata = allX))
+
+n_tr <- sum(all_df$.set=="train")
+Xtr <- X_all[1:n_tr, , drop=FALSE]
+Xte <- X_all[(n_tr+1):nrow(X_all), , drop=FALSE]
+ytr <- all_df[[target]][all_df$.set=="train"]
+yte <- all_df[[target]][all_df$.set=="test"]
+
+# --- Remove near-zero-variance columns after encoding ---
+nzv_cols <- nearZeroVar(Xtr)
+if(length(nzv_cols)){
+  Xtr <- Xtr[, -nzv_cols, drop=FALSE]
+  Xte <- Xte[, -nzv_cols, drop=FALSE]
+}
+
+# --- Scale numeric features (required for KNN) ---
+pp <- preProcess(Xtr, method = c("center","scale"))
+Xtr_s <- predict(pp, Xtr)
+Xte_s <- predict(pp, Xte)
+
+# --- Train KNN with 5-fold CV ---
+set.seed(42)
+knn_fit <- train(
+  x = Xtr_s, y = ytr,
+  method = "knn",
+  tuneGrid = data.frame(k = seq(3,31,by=2)),
+  trControl = trainControl(method="cv", number=5),
+  metric = "RMSE"
+)
+
+print(knn_fit$results)
+cat("Best k:", knn_fit$bestTune$k, "\n")
+
+# --- Evaluate on test set ---
+knn_pred <- predict(knn_fit, Xte_s)
+rmse <- sqrt(mean((knn_pred - yte)^2))
+mae  <- mean(abs(knn_pred - yte))
+r2   <- cor(knn_pred, yte, use="complete.obs")^2
+cat("KNN — RMSE:", round(rmse,3), " | MAE:", round(mae,3), " | R²:", round(r2,3), "\n")
+```
+
+```{r}
+# ==== Improved KNN (distance-weighted, low-dim numeric, cyclical time) ====
+library(dplyr)
+library(caret)
+
+target <- "roas"
+
+# 1) Start from your cleaned splits
+drop_cols <- c(target,"asin","sku","adid","adgroupid","campaignid",
+               "reportdate","campaignname","adgroupname","week_start","year_month")
+
+# Remove proxy/leakage cols
+leakage_cols <- c("attributedsales14d","sales_camp","roasclicks14d")
+base_preds <- setdiff(names(train_df), c(drop_cols, leakage_cols))
+
+# 2) Build modeling frames and engineer cyclical time features
+prep_knn <- function(df){
+  out <- df %>%
+    mutate(
+      # ensure numeric time codes first
+      dow_num   = as.numeric(as.character(dow)),   # if already numeric, this is a no-op
+      month_num = as.numeric(as.character(month)),
+      # cyclical encodings (reduce one-hot explosion)
+      dow_sin   = sin(2*pi*(dow_num   / 7)),
+      dow_cos   = cos(2*pi*(dow_num   / 7)),
+      mon_sin   = sin(2*pi*(month_num / 12)),
+      mon_cos   = cos(2*pi*(month_num / 12))
+    )
+  # Keep mostly numeric campaign signals; drop high-cardinality categoricals for KNN
+  keep <- intersect(c(
+    "clicks","cost","impressions","spend",
+    "attributedconversions14d","convs_camp",     # keep if you’re OK using same-day counts
+    "ctr","cvr","cpc","roas",                    # roas is target; we’ll drop it below
+    "impressions_camp","clicks_camp","cost_camp",
+    "biddingstrategy","campaignstatus.x",        # drop these in KNN to avoid many dummies
+    "dow_sin","dow_cos","mon_sin","mon_cos"
+  ), c(base_preds, "dow_sin","dow_cos","mon_sin","mon_cos", target))
+  out[, unique(keep), drop = FALSE]
+}
+
+tr0 <- prep_knn(train_df)
+te0 <- prep_knn(test_df)
+
+# 3) Final predictor set: numeric only (drop target, remove factors)
+tr0 <- tr0 %>% mutate(across(where(is.character), as.factor))
+te0 <- te0 %>% mutate(across(where(is.character), as.factor))
+
+predictors <- setdiff(names(tr0), target)
+# Drop any remaining factors to keep KNN numeric + low-dim
+fac_cols <- names(tr0)[sapply(tr0, is.factor)]
+predictors <- setdiff(predictors, fac_cols)
+
+Xtr <- tr0[, predictors, drop=FALSE]
+Xte <- te0[, predictors, drop=FALSE]
+ytr <- train_df[[target]]
+yte <- test_df[[target]]
+
+# 4) Remove zero/near-zero variance and scale
+nzv <- nearZeroVar(Xtr)
+if(length(nzv)){
+  Xtr <- Xtr[, -nzv, drop=FALSE]
+  Xte <- Xte[, -nzv, drop=FALSE]
+}
+pp  <- preProcess(Xtr, method = c("center","scale"))
+Xtr <- predict(pp, Xtr)
+Xte <- predict(pp, Xte)
+
+# 5) Distance-weighted KNN using caret's 'kknn' (better than plain 'knn')
+set.seed(42)
+grid <- expand.grid(
+  kmax    = seq(5,35,by=2),    # neighborhood size
+  distance= c(1,2),            # 1=Manhattan, 2=Euclidean
+  kernel  = c("optimal","triangular","epanechnikov")  # distance weighting
+)
+
+knn_dw <- train(
+  x = Xtr, y = ytr,
+  method = "kknn",
+  tuneGrid = grid,
+  trControl = trainControl(method="cv", number=5),
+  metric = "RMSE"
+)
+
+print(knn_dw$bestTune)
+
+# 6) Evaluate on test
+pred  <- predict(knn_dw, Xte)
+rmse  <- sqrt(mean((pred - yte)^2))
+mae   <- mean(abs(pred - yte))
+r2    <- cor(pred, yte, use="complete.obs")^2
+cat("KNN (distance-weighted) — RMSE:", round(rmse,3),
+    " | MAE:", round(mae,3), " | R²:", round(r2,3), "\n")
+
+# Optional quick check:
+# plot(yte, pred, pch=16, cex=.6); abline(0,1,col="red")
+```
+
+```{r}
+# ==== PCR & PLS for ROAS (time-aware split already done) ====
+# Needs: train_df, test_df
+# pkgs
+library(dplyr)
+library(pls)     # pcr(), plsr()
+
+# --- 0) Target & guards (same as XGB) ---
+target <- "roas"
+drop_cols <- c(target, "asin","sku","adid","adgroupid","campaignid",
+               "reportdate","campaignname","adgroupname","week_start","year_month")
+leakage_cols <- c("attributedsales14d","sales_camp","roasclicks14d")
+
+# predictors list
+predictors <- setdiff(names(train_df), c(drop_cols, leakage_cols))
+
+# Keep rows with target present
+train_df <- train_df %>% filter(!is.na(.data[[target]]))
+test_df  <- test_df  %>% filter(!is.na(.data[[target]]))
+
+# --- 1) Bind to align factor levels; drop low-variance cols ---
+train_df$.set <- "train"; test_df$.set <- "test"
+all_df <- bind_rows(train_df, test_df)
+
+# treat remaining characters as factors (so model.matrix will one-hot them)
+allX <- all_df[, predictors, drop = FALSE] %>%
+  mutate(across(where(is.character), as.factor))
+
+# drop single-level factors / zero-variance numerics BEFORE encoding
+is_single_factor <- function(v) is.factor(v) && nlevels(v) < 2
+is_zero_num <- function(v) is.numeric(v) && (sd(v, na.rm=TRUE) == 0 || all(is.na(v)))
+bad_fct <- names(Filter(is_single_factor, allX))
+bad_num <- names(Filter(is_zero_num, allX))
+bad_cols <- union(bad_fct, bad_num)
+if (length(bad_cols)) message("Dropping low-variance predictors: ", paste(bad_cols, collapse=", "))
+predictors_safe <- setdiff(names(allX), bad_cols)
+
+allX2 <- allX[, predictors_safe, drop = FALSE]
+# one-hot encode (no intercept)
+X_all <- model.matrix(~ . - 1, data = allX2)
+y_all <- all_df[[target]]
+
+# split back
+tr_idx <- which(all_df$.set == "train")
+te_idx <- which(all_df$.set == "test")
+Xtr <- X_all[tr_idx, , drop = FALSE]
+Xte <- X_all[te_idx,  , drop = FALSE]
+ytr <- y_all[tr_idx]
+yte <- y_all[te_idx]
+
+# Optional: remove any columns that are all-NA after split
+keep_cols <- which(colSums(!is.na(Xtr)) > 0 & apply(Xtr, 2, sd, na.rm=TRUE) > 0)
+Xtr <- Xtr[, keep_cols, drop=FALSE]
+Xte <- Xte[, keep_cols, drop=FALSE]
+
+# ---------------- PCR ----------------
+set.seed(42)
+pcr_fit <- pcr(ytr ~ Xtr, scale = TRUE, validation = "CV")  # K-fold CV on train
+# pick optimal ncomp by lowest RMSEP
+pcr_rmsep <- RMSEP(pcr_fit)
+pcr_ncomp <- which.min(pcr_rmsep$val[estimator = "CV", , ])  # CV estimate
+cat("PCR best ncomp:", pcr_ncomp, "\n")
+
+pcr_pred <- as.numeric(predict(pcr_fit, newdata = data.frame(Xtr = I(Xte)), ncomp = pcr_ncomp))
+pcr_rmse <- sqrt(mean((pcr_pred - yte)^2))
+pcr_mae  <- mean(abs(pcr_pred - yte))
+pcr_r2   <- cor(pcr_pred, yte, use = "complete.obs")^2
+cat("PCR — RMSE:", round(pcr_rmse,3), " | MAE:", round(pcr_mae,3), " | R²:", round(pcr_r2,3), "\n")
+
+# ---------------- PLS ----------------
+set.seed(42)
+pls_fit <- plsr(ytr ~ Xtr, scale = TRUE, validation = "CV")
+pls_rmsep <- RMSEP(pls_fit)
+pls_ncomp <- which.min(pls_rmsep$val[estimator = "CV", , ])
+cat("PLS best ncomp:", pls_ncomp, "\n")
+
+pls_pred <- as.numeric(predict(pls_fit, newdata = data.frame(Xtr = I(Xte)), ncomp = pls_ncomp))
+pls_rmse <- sqrt(mean((pls_pred - yte)^2))
+pls_mae  <- mean(abs(pls_pred - yte))
+pls_r2   <- cor(pls_pred, yte, use = "complete.obs")^2
+cat("PLS — RMSE:", round(pls_rmse,3), " | MAE:", round(pls_mae,3), " | R²:", round(pls_r2,3), "\n")
+```
+
+```{r}
+# ==== PLS with log1p(ROAS), robust encoding & CV-tuned ncomp ====
+# Assumes: train_df, test_df exist from your time-based split
+
+library(dplyr)
+library(caret)   # will use method = "pls" (requires {pls} under the hood)
+
+# 0) Target transform (log1p) and keep rows with non-missing target
+train_df <- train_df %>% mutate(roas_log = log1p(roas)) %>% filter(!is.na(roas_log))
+test_df  <- test_df  %>% mutate(roas_log = log1p(roas))  %>% filter(!is.na(roas_log))
+target <- "roas_log"
+
+# 1) Define columns to exclude + leakage guards
+drop_cols <- c("roas", target, "asin","sku","adid","adgroupid","campaignid",
+               "reportdate","campaignname","adgroupname","week_start","year_month")
+leakage_cols <- c("attributedsales14d","sales_camp","roasclicks14d")
+
+predictors <- setdiff(names(train_df), c(drop_cols, leakage_cols))
+
+# 2) Bind to align factor levels across train/test
+train_df$.set <- "train"; test_df$.set <- "test"
+all_df <- bind_rows(train_df, test_df)
+
+# 3) Build feature frame; coerce character -> factor
+allX <- all_df[, predictors, drop = FALSE] %>%
+  mutate(across(where(is.character), as.factor))
+
+# --- Drop problematic columns BEFORE dummyVars() ---
+is_single_factor <- function(v) is.factor(v) && nlevels(v) < 2
+is_zero_num      <- function(v) is.numeric(v) && (sd(v, na.rm = TRUE) == 0 || all(is.na(v)))
+
+single_level_fct <- names(Filter(is_single_factor, allX))
+zero_var_num     <- names(Filter(is_zero_num, allX))
+bad_cols <- union(single_level_fct, zero_var_num)
+if (length(bad_cols)) message("Dropping low-variance predictors: ", paste(bad_cols, collapse = ", "))
+
+allX <- allX[, setdiff(names(allX), bad_cols), drop = FALSE]
+
+# 4) One-hot encode consistently with dummyVars (fullRank avoids collinearity)
+dmy <- dummyVars(~ ., data = allX, fullRank = TRUE)
+suppressWarnings({
+  X_all <- as.data.frame(predict(dmy, newdata = allX))
+})
+
+# 5) Split back into train/test design matrices
+n_tr <- sum(all_df$.set == "train")
+Xtr  <- X_all[1:n_tr, , drop = FALSE]
+Xte  <- X_all[(n_tr + 1):nrow(X_all), , drop = FALSE]
+ytr  <- train_df[[target]]
+yte  <- test_df[[target]]   # still in log-space
+
+# 6) Remove near-zero-variance columns based on train
+nzv <- nearZeroVar(Xtr)
+if (length(nzv)) {
+  Xtr <- Xtr[, -nzv, drop = FALSE]
+  Xte <- Xte[, -nzv, drop = FALSE]
+}
+
+# 7) Train PLS with 5-fold CV; caret handles centering/scaling
+set.seed(42)
+train_pls <- data.frame(y = ytr, Xtr)
+ctrl <- trainControl(method = "cv", number = 5)
+
+pls_fit <- train(
+  y ~ .,
+  data = train_pls,
+  method = "pls",
+  preProcess = c("center", "scale"),
+  tuneLength = 25,                 # try up to 25 components
+  trControl = ctrl,
+  metric = "RMSE"
+)
+
+print(pls_fit$bestTune)            # chosen ncomp
+
+# Predict in log(1+ROAS) space
+pred_log <- as.numeric(predict(pls_fit, newdata = test_pls))
+
+# Evaluate directly in log-space (same scale as model training)
+rmse <- sqrt(mean((pred_log - yte)^2, na.rm = TRUE))
+mae  <- mean(abs(pred_log - yte), na.rm = TRUE)
+r2   <- cor(pred_log, yte, use = "complete.obs")^2
+
+cat("PLS (log1p target, evaluated in log-space) — RMSE:", round(rmse,3),
+    " | MAE:", round(mae,3), " | R²:", round(r2,3), "\n")
+
+# Optional: interpret approximate scale
+cat("Mean predicted ROAS:", round(mean(expm1(pred_log)),2),
+    "| Mean actual ROAS:", round(mean(expm1(yte)),2), "\n")
+```
+
+```{r}
+#Test Multiple Configurations 
+ctrl_loocv <- trainControl(method = "LOOCV")
+ctrl_repeated <- trainControl(method = "repeatedcv", number = 5, repeats = 3)
+
+# Try repeated CV
+set.seed(42)
+pls_repeated <- train(
+  y ~ ., data = train_pls,
+  method = "pls",
+  preProcess = c("center", "scale"),
+  tuneLength = 30,
+  trControl = ctrl_repeated,
+  metric = "RMSE"
+)
+```
+
+```{r}
+#Residual Dignostics
+# Residuals (log scale)
+resid <- pred_log - yte
+
+# Histogram
+hist(resid, breaks = 30, col = "gray", main = "PLS Residuals Histogram")
+
+# Residuals vs Fitted
+plot(pred_log, resid, pch = 16, main = "Residuals vs Predicted (log scale)",
+     xlab = "Predicted log(1 + ROAS)", ylab = "Residuals")
+abline(h = 0, lty = 2, col = "red")
+
+# Time plot
+plot(test_df$reportdate, resid, pch = 16, cex = 0.7,
+     main = "Residuals over Time", xlab = "Date", ylab = "Residuals (log-space)")
+abline(h = 0, lty = 2)
+
+# Optional: back-transform predictions
+pred_raw <- expm1(pred_log)
+actual_raw <- expm1(yte)
+plot(actual_raw, pred_raw, pch = 16, cex = 0.6,
+     xlab = "Actual ROAS", ylab = "Predicted ROAS", main = "Predicted vs Actual ROAS")
+abline(0, 1, col = "blue", lty = 2)
+```
+
+```{r}
+#VIsualize Component Importance 
+library(pls)
+expl_var <- explvar(pls_fit$finalModel)
+barplot(expl_var, names.arg = 1:length(expl_var),
+        main = "Explained Variance by PLS Components", xlab = "Component", ylab = "Variance (%)")
+```
+
+```{r}
+#Variable Importance 
+library(pls)
+expl_var <- explvar(pls_fit$finalModel)
+barplot(expl_var, names.arg = 1:length(expl_var),
+        main = "Explained Variance by PLS Components", xlab = "Component", ylab = "Variance (%)")
+```
+
+#OLS and Interation Models #Load required libraries
+
+```{r}
+#install.packages("tidyverse")
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(rsample)
+library(recipes)   
+library(skimr)     
+library(slider)    
+library(glue)
+```
+
+#Load training and testing data
+
+```{r}
+train_df <- readr::read_csv("artifacts/train_sp_joined.csv", show_col_types = FALSE)
+test_df  <- readr::read_csv("artifacts/test_sp_joined.csv",  show_col_types = FALSE)
+
+
+```
+
+#Select variables and remove missing ROAS
+
+```{r}
+vars_needed <- c("ctr", "cvr", "cpc", "roas",
+                 "impressions", "clicks", "cost", "campaignbudget")
+
+train_mod <- train_df %>%
+  dplyr::select(all_of(vars_needed)) %>%
+  dplyr::filter(!is.na(roas))
+
+test_mod <- test_df %>%
+  dplyr::select(all_of(vars_needed)) %>%
+  dplyr::filter(!is.na(roas))
+
+
+```
+
+\
+#interaction variable (Impressions × Cost)
+
+```{r}
+
+train_mod <- train_mod %>%
+  mutate(imp_cost = impressions * cost)
+
+test_mod <- test_mod %>%
+  mutate(imp_cost = impressions * cost)
+
+
+```
+
+\
+#Metric functions (RMSE, MAE, R²)
+
+```{r}
+
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted), na.rm = TRUE)
+}
+
+r2 <- function(actual, predicted) {
+  ss_res <- sum((actual - predicted)^2, na.rm = TRUE)
+  ss_tot <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res / ss_tot
+}
+
+y_test <- test_mod$roas
+
+```
+
+#OLS Full Model
+
+```{r}
+M2_model <- lm(
+  roas ~ ctr + cvr + cpc + impressions + clicks + cost + campaignbudget,
+  data = train_mod
+)
+
+M2_pred <- predict(M2_model, newdata = test_mod)
+
+M2_rmse <- rmse(y_test, M2_pred)
+M2_mae  <- mae(y_test, M2_pred)
+M2_r2   <- r2(y_test, M2_pred)
+
+M2_rmse; M2_mae; M2_r2
+
+
+```
+
+#OLS with Interaction: Impressions × Cost
+
+```{r}
+M5_model <- lm(
+  roas ~ impressions * cost + ctr + cvr + cpc + campaignbudget,
+  data = train_mod
+)
+
+M5_pred <- predict(M5_model, newdata = test_mod)
+
+M5_rmse <- rmse(y_test, M5_pred)
+M5_mae  <- mae(y_test, M5_pred)
+M5_r2   <- r2(y_test, M5_pred)
+
+M5_rmse; M5_mae; M5_r2
+```

@@ -8,7 +8,7 @@ This project develops a **predictive analytics framework** to forecast **next-da
 
 In highly dynamic, auction-based advertising environments, advertisers must make daily decisions about **budget pacing, bid adjustments, and campaign activation**. Traditional rule-based or reactive approaches fail to capture the **nonlinear, volatile behavior** of ROAS.
 
-Our goal was to shift decision-making from *reactive* to *forward-looking* by identifying the **key drivers of next-day ROAS** and evaluating which modeling approaches generalize best over time :contentReference[oaicite:0]{index=0}.
+Our goal was to shift decision-making from *reactive* to *forward-looking* by identifying the **key drivers of next-day ROAS** and evaluating which modeling approaches generalize best over time
 
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide1.PNG)
 
@@ -88,7 +88,7 @@ Key EDA insights:
 - Strong correlations among clicks, cost, and conversions
 - Limited seasonality, with mild weekday effects
 
-These patterns suggested that **tree-based ensemble models** would outperform linear approaches :contentReference[oaicite:4]{index=4}.
+These patterns suggested that **tree-based ensemble models** would outperform linear approaches
 
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide8.PNG)
 
@@ -133,7 +133,7 @@ These patterns suggested that **tree-based ensemble models** would outperform li
 | Random Forest | 23.02 | 1.55 | 0.86 |
 | PLS (log ROAS) | 0.55* | 0.39* | 0.73* |
 
-\* Metrics reported in log-space for PLS :contentReference[oaicite:5]{index=5}
+\* Metrics reported in log-space for PLS
 
 **XGBoost** delivered the best overall accuracy, robustness, and stability across time.
 
@@ -154,7 +154,7 @@ Across models, the most influential predictors were:
 - **Spend & Impression Volume**
 
 Key insight:
-> ROAS exhibits **diminishing returns** — higher spend does not guarantee better performance unless engagement improves proportionally :contentReference[oaicite:6]{index=6}.
+> ROAS exhibits **diminishing returns** — higher spend does not guarantee better performance unless engagement improves proportionally 
 
 ---
 
@@ -199,7 +199,6 @@ Future improvements include rolling validation, lagged features, and uplift mode
 - Move toward automated budget and bid recommendations
 
 ---
-
 
 **Contributors:** Fahima Alizada, Marco Capoccia, Dheeraj Shetty, Sahaj Kaur  
 **Date:** December 2025  

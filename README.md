@@ -29,8 +29,6 @@ Our goal was to shift decision-making from *reactive* to *forward-looking* by id
 
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide3.PNG)
 
-![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide3.PNG)
-
 ![Image alt](https://github.com/dheerajshetty07/Ad-Spend-Optimization-ROAS-Forecasting/blob/main/Slides/Team%20Normalizers%20Powerpoint/Slide4.PNG)
 
 ---
